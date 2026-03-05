@@ -820,11 +820,12 @@ tr:hover td { background:#fafafa; }
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<!-- FIREBASE SDK -->
-<script type="module">
-import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
-import { getFirestore, doc, setDoc, getDoc, onSnapshot, enableIndexedDbPersistence } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
 
+<!-- FIREBASE COMPAT SDK (works on GitHub Pages, local files, everywhere) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script>
+(function(){
 const firebaseConfig = {
   apiKey: "AIzaSyDheZaAzzZ6duYukbyt-xPN9chnovut7PY",
   authDomain: "mi-negocio-tienda.firebaseapp.com",
@@ -834,59 +835,66 @@ const firebaseConfig = {
   appId: "1:118376076882:web:9a2453738db1ae794bb18b"
 };
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const DOC_REF = doc(db, 'negocio', 'datos');
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const DOC_REF = db.collection('negocio').doc('datos');
 
-// Enable offline persistence
-try {
-  enableIndexedDbPersistence(db).catch(()=>{});
-} catch(e){}
+// Enable offline persistence so it works without internet too
+db.enablePersistence().catch(()=>{});
 
-// Connection timeout — if Firebase doesn't respond in 8s, show offline
-let connectTimeout = setTimeout(()=>setSyncStatus('offline'), 8000);
+// Connection timeout
+let connectTimeout = setTimeout(()=>setSyncStatus('offline'), 10000);
 
 // ── Sync status indicator ──
 function setSyncStatus(status) {
   const el = document.getElementById('sync-status');
   if (!el) return;
   const states = {
-    syncing:  { ico: '🔄', txt: 'Guardando...', color: '#f59e0b' },
-    ok:       { ico: '☁️',  txt: 'Sincronizado', color: '#16a34a' },
-    offline:  { ico: '📴', txt: 'Sin conexión', color: '#94a3b8' },
-    error:    { ico: '⚠️', txt: 'Error al guardar', color: '#dc2626' },
-    connecting: { ico: '🔄', txt: 'Conectando...', color: '#2563eb' },
+    syncing:    { ico: '🔄', txt: 'Guardando...', color: '#f59e0b' },
+    ok:         { ico: '☁️',  txt: 'Sincronizado', color: '#16a34a' },
+    offline:    { ico: '📴', txt: 'Sin conexión',  color: '#94a3b8' },
+    error:      { ico: '⚠️', txt: 'Error',         color: '#dc2626' },
+    connecting: { ico: '🔵', txt: 'Conectando...',  color: '#2563eb' },
   };
   const s = states[status] || states.ok;
   el.innerHTML = `<span style="color:${s.color};font-weight:700;font-size:.78rem;display:flex;align-items:center;gap:4px">${s.ico} ${s.txt}</span>`;
 }
+window.setSyncStatus = setSyncStatus;
 
 // ── Save to Firebase + localStorage ──
-window.saveToFirebase = async function() {
-  setSyncStatus('syncing');
-  // Don't save large base64 images to Firebase (too big), strip them
-  const dbClean = JSON.parse(JSON.stringify(window.DB));
-  dbClean.productos = dbClean.productos.map(p => ({ ...p, img: p.img ? '__img__' : undefined }));
-  try {
-    await setDoc(DOC_REF, dbClean);
-    setSyncStatus('ok');
-  } catch(e) {
-    console.error('Firebase save error:', e);
-    setSyncStatus('error');
-  }
-  // Always save full data (with images) to localStorage as backup
-  localStorage.setItem('mn3_db', JSON.stringify(window.DB));
+let saveTimer = null;
+window.saveToFirebase = function() {
+  // Debounce: wait 1.5s after last change before saving
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    setSyncStatus('syncing');
+    const dbClean = JSON.parse(JSON.stringify(window.DB));
+    // Strip base64 images — too large for Firestore (1MB limit per doc)
+    dbClean.productos = (dbClean.productos||[]).map(p => {
+      const c = {...p};
+      if(c.img) c.img = '__img__';
+      return c;
+    });
+    try {
+      await DOC_REF.set(dbClean);
+      setSyncStatus('ok');
+    } catch(e) {
+      console.error('Firebase save error:', e);
+      setSyncStatus('error');
+    }
+    localStorage.setItem('mn3_db', JSON.stringify(window.DB));
+  }, 1500);
 };
 
 // ── Load from Firebase on startup ──
-async function loadFromFirebase() {
-  setSyncStatus('syncing');
+window._loadFromFirebase = async function() {
+  setSyncStatus('connecting');
   try {
-    const snap = await getDoc(DOC_REF);
+    const snap = await DOC_REF.get();
     clearTimeout(connectTimeout);
-    if (snap.exists()) {
+    if (snap.exists) {
       const cloudData = snap.data();
-      // Merge: restore images from localStorage if available
+      // Restore product images from localStorage
       const localData = JSON.parse(localStorage.getItem('mn3_db') || 'null');
       if (localData && localData.productos) {
         cloudData.productos = (cloudData.productos||[]).map(cp => {
@@ -895,18 +903,20 @@ async function loadFromFirebase() {
           return cp;
         });
       }
-      window.DB = Object.assign({ productos:[], ventas:[], gastos:[], fiados:[], clientes:[], movimientos:[] }, cloudData);
+      window.DB = Object.assign({
+        productos:[], ventas:[], gastos:[], fiados:[], clientes:[], movimientos:[]
+      }, cloudData);
       localStorage.setItem('mn3_db', JSON.stringify(window.DB));
       setSyncStatus('ok');
-      // Re-render everything
       if (window.appReady) {
-        renderCats(); renderProducts(); renderGastos(); renderGanancias(); renderInventario(); renderFiados();
+        renderCats(); renderProducts(); renderGastos();
+        renderGanancias(); renderInventario(); renderFiados();
       }
     } else {
-      // First time: push local data to Firebase
+      // Primera vez — sube datos locales a Firebase
       const clean = JSON.parse(JSON.stringify(window.DB));
-      clean.productos = clean.productos.map(p=>({...p, img: p.img?'__img__':undefined}));
-      await setDoc(DOC_REF, clean);
+      clean.productos = (clean.productos||[]).map(p=>{ const c={...p}; if(c.img) c.img='__img__'; return c; });
+      await DOC_REF.set(clean);
       setSyncStatus('ok');
     }
   } catch(e) {
@@ -914,32 +924,33 @@ async function loadFromFirebase() {
     console.error('Firebase load error:', e);
     setSyncStatus('offline');
   }
-}
+};
 
-// ── Real-time listener (syncs changes from other devices) ──
-onSnapshot(DOC_REF, (snap) => {
-  if (!snap.exists() || !window.appReady) return;
+// ── Real-time listener — syncs across all devices instantly ──
+DOC_REF.onSnapshot((snap) => {
+  if (!snap.exists || !window.appReady) return;
   const cloudData = snap.data();
-  // Restore images from localStorage
   const localData = JSON.parse(localStorage.getItem('mn3_db') || 'null');
   if (localData && localData.productos) {
-    cloudData.productos = cloudData.productos.map(cp => {
+    cloudData.productos = (cloudData.productos||[]).map(cp => {
       const lp = localData.productos.find(p => p.id === cp.id);
       if (lp && lp.img && cp.img === '__img__') cp.img = lp.img;
       return cp;
     });
   }
-  window.DB = Object.assign({ productos:[], ventas:[], gastos:[], fiados:[], clientes:[], movimientos:[] }, cloudData);
+  window.DB = Object.assign({
+    productos:[], ventas:[], gastos:[], fiados:[], clientes:[], movimientos:[]
+  }, cloudData);
   localStorage.setItem('mn3_db', JSON.stringify(window.DB));
   setSyncStatus('ok');
-  renderCats(); renderProducts(); renderGastos(); renderGanancias(); renderInventario(); renderFiados();
+  renderCats(); renderProducts(); renderGastos();
+  renderGanancias(); renderInventario(); renderFiados();
 }, (err) => {
   console.error('Snapshot error:', err);
   setSyncStatus('offline');
 });
 
-// Expose load function
-window._loadFromFirebase = loadFromFirebase;
+})();
 </script>
 
 <script>
